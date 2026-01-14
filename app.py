@@ -1,118 +1,120 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
-import re
 
-st.set_page_config(page_title="Sınıf ve İsim Odaklı Analiz", layout="wide")
+st.set_page_config(page_title="Dershane Analiz - Tablo Modu", layout="wide")
 
-st.title("🎯 İsim/Sınıf Listesi ile Analiz Sistemi")
+st.title("🛡️ Tablo Tabanlı Kesin Çözüm")
+st.info("Bu modül, PDF içindeki tabloları doğrudan analiz eder. Metin kaymalarından etkilenmez.")
 
-# --- KULLANICI ARAYÜZÜ ---
-col1, col2 = st.columns(2)
-with col1:
-    uploaded_pdf = st.file_uploader("1. Deneme Sonuç PDF'ini Yükle", type=["pdf"])
-with col2:
-    # Normalde burası Excel yükleme alanı olacak, şimdilik manuel giriş yapalım
-    st.info("Sisteme kayıtlı öğrenci listesi (Simülasyon)")
-    student_list_text = st.text_area("Öğrenci İsimlerini Yazın (Her satıra bir isim)", 
-                                     value="FEYAS PEKER\nRUKİYE GÖNEN\nAHMET YILMAZ")
+uploaded_file = st.file_uploader("PDF Dosyasını Yükle", type=["pdf"])
 
-def analyze_by_name(pdf_file, target_names):
+def clean_text(text):
+    """Metindeki gereksiz boşlukları ve satır atlamaları temizler."""
+    if text:
+        return str(text).replace('\n', ' ').strip()
+    return ""
+
+def is_topic_row(row):
     """
-    Belirli isimleri PDF'te arar ve o ismin bulunduğu bölgedeki konu analizlerini çeker.
+    Bir satırın 'Konu Analiz Satırı' olup olmadığını anlamaya çalışır.
+    Mantık: İlk sütun metin olmalı, diğer sütunlarda rakamlar (1010 veya net sayısı) olmalı.
     """
-    results = []
-    target_names = [name.strip().upper() for name in target_names.split('\n') if name.strip()]
+    # Satır boşsa veya çok kısaysa atla
+    clean_row = [x for x in row if x is not None and str(x).strip() != ""]
+    if len(clean_row) < 2:
+        return False
     
-    with pdfplumber.open(pdf_file) as pdf:
-        # Tüm sayfaları tek tek gez
-        for page in pdf.pages:
-            text = page.extract_text()
-            if not text: continue
+    first_cell = clean_text(clean_row[0])
+    last_cell = clean_text(clean_row[-1])
+    
+    # Konu adı çok kısa olamaz (Örn: "A", "B" şıkkı değildir)
+    if len(first_cell) < 3: 
+        return False
+        
+    # İlk hücrede "TOPLAM", "NET", "SIRA" gibi başlıklar varsa atla
+    forbidden_words = ["TOPLAM", "GENEL", "SIRA", "ADI", "SOYADI", "TYT", "NET"]
+    if any(word in first_cell.upper() for word in forbidden_words):
+        return False
+
+    # Son hücrede veya ikinci hücrede rakam var mı? (10101 veya 3 1 2)
+    # Rakam barındırıyor mu kontrolü
+    has_digits = any(char.isdigit() for char in last_cell)
+    
+    return has_digits
+
+def extract_tables_logic(file):
+    all_data = []
+    debug_tables = [] # Ne gördüğümüzü anlamak için
+    
+    with pdfplumber.open(file) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            # Sayfadaki tüm tabloları çıkar
+            tables = page.extract_tables()
             
-            # Bu sayfada hedef listeden kimse var mı?
-            found_student = None
-            for name in target_names:
-                if name in text:
-                    found_student = name
-                    break
-            
-            if found_student:
-                # Öğrenci bulundu! Şimdi o sayfadaki konu analizlerini çekelim.
-                # PDF'teki satırları geziyoruz
-                lines = text.split('\n')
+            for table in tables:
+                if not table: continue
                 
-                for line in lines:
-                    # KONU ANALİZİ YAKALAMA (Regex ile konu ve puanları bul)
-                    # Mantık: Konu Adı (Metin) + Boşluk + Sayısal Veriler (Net, Doğru, Yanlış vs.)
-                    # Örnek Satır: "HÜCRE 1010" veya "TÜREV 4 2 2"
+                # Tablodaki her satıra bak
+                for row in table:
+                    # Satır boş mu?
+                    if not any(row): continue
                     
-                    # Regex: En az 3 harfli bir kelime ile başla, sonunda rakamlar olsun
-                    match = re.search(r'([A-ZİĞÜŞÖÇ\s\(\)-]{3,})\s+([0-9\s]+)$', line)
-                    
-                    if match:
-                        konu = match.group(1).strip()
-                        rakamlar = match.group(2).strip()
+                    # Bu satır bir konu analizi mi?
+                    if is_topic_row(row):
+                        # Veriyi temizle
+                        konu = clean_text(row[0]) # Genelde ilk sütun konudur
                         
-                        # Filtreler (Gereksiz satırları at)
-                        if "TYT" in konu or "TOPLAM" in konu or "NET" in konu: continue
-                        if len(konu) < 3: continue
+                        # Verinin geri kalanı (Performans)
+                        # Bazen sütunlar kayar, geri kalan tüm dolu hücreleri birleştirelim
+                        diger_hucreler = [clean_text(x) for x in row[1:] if x is not None]
+                        veri_yigini = " ".join(diger_hucreler)
                         
-                        # Rakamları çözümle (Bu kısım PDF tipine göre değişir)
-                        # Eğer 1010 ise karakter say, eğer 4 2 1 ise boşluktan ayır
-                        if "0" in rakamlar and "1" in rakamlar and len(rakamlar) > 2 and not " " in rakamlar:
-                            # Bu 1010 formatıdır
-                            dogru = rakamlar.count('1')
-                            yanlis = rakamlar.count('0')
-                            toplam = len(rakamlar)
-                            tip = "Kodlu"
-                        else:
-                            # Bu muhtemelen "Soru Doğru Yanlış" formatıdır (Boşluklu sayılar)
-                            parts = [int(s) for s in rakamlar.split() if s.isdigit()]
-                            if len(parts) >= 2:
-                                toplam = parts[0]
-                                dogru = parts[1] if len(parts) > 1 else 0
-                                yanlis = toplam - dogru
-                                tip = "Sayısal"
-                            else:
-                                continue # Anlamsız veri
-                                
-                        basari = int((dogru / toplam) * 100) if toplam > 0 else 0
-                        
-                        results.append({
-                            "Sınıf": "12-A (Listeden)", # Burası Excel'den gelecek
-                            "Öğrenci": found_student,
-                            "Konu": konu,
-                            "Doğru": dogru,
-                            "Yanlış/Boş": yanlis,
-                            "Başarı %": basari
+                        all_data.append({
+                            "Sayfa": page_num + 1,
+                            "Konu Olasılığı": konu,
+                            "Veri": veri_yigini
                         })
+                
+                # Debug için tabloyu kaydedelim (İlk 5 satır)
+                debug_tables.append(pd.DataFrame(table).head(3))
 
-    return pd.DataFrame(results)
+    return pd.DataFrame(all_data), debug_tables
 
-if uploaded_pdf and student_list_text:
-    st.write("Analiz ediliyor...")
-    df = analyze_by_name(uploaded_pdf, student_list_text)
+if uploaded_file:
+    st.write("Tablolar taranıyor...")
     
-    if not df.empty:
-        st.success("Veriler başarıyla çekildi!")
+    try:
+        df_results, debug_info = extract_tables_logic(uploaded_file)
         
-        # Sınıf Bazlı Analiz Sekmesi
-        tab1, tab2 = st.tabs(["Öğrenci Detay", "Sınıf Genel Analiz"])
-        
-        with tab1:
-            st.dataframe(df)
+        if not df_results.empty:
+            st.success(f"Toplam {len(df_results)} adet veri satırı bulundu!")
             
-        with tab2:
-            st.subheader("Sınıfın En Çok Zorlandığı Konular")
-            # Konuya göre grupla ve ortalama başarıyı al
-            sinif_analiz = df.groupby("Konu")["Başarı %"].mean().sort_values().head(10)
-            st.bar_chart(sinif_analiz)
+            col1, col2 = st.columns([2, 1])
             
-            st.warning("Bu konular için etüt planlanabilir!")
-    else:
-        st.error("Eşleşen öğrenci veya konu verisi bulunamadı. İsimlerin PDF'teki ile birebir aynı olduğundan emin olun.")
-        # Debug için metni göster
-        with pdfplumber.open(uploaded_pdf) as pdf:
-            st.text("PDF İçeriği (İlk 500 karakter):")
-            st.text(pdf.pages[0].extract_text()[:500])
+            with col1:
+                st.subheader("📊 Çıkarılan Ham Veriler")
+                st.dataframe(df_results, use_container_width=True)
+                
+            with col2:
+                st.subheader("🔍 Nasıl Yorumlamalı?")
+                st.markdown("""
+                Sistem PDF'teki tablo satırlarını çıkardı.
+                - **Konu Olasılığı:** Satırın başındaki yazı.
+                - **Veri:** Yanındaki rakamlar (1010 veya doğru/yanlış sayıları).
+                
+                Eğer burada verileri doğru görüyorsan, artık bunları sayıya döküp grafiğe çevirmek çocuk oyuncağı.
+                """)
+                
+        else:
+            st.error("Tablo yapısı tespit edilemedi veya veriler beklenen formatta değil.")
+            st.warning("Aşağıdaki 'Sistemin Gördüğü' kısmına bakarak PDF'in nasıl okunduğunu kontrol et.")
+            
+        with st.expander("🛠️ Geliştirici Modu: Sistemin Gördüğü Tablolar (Debug)"):
+            st.write("PDF Plumber bu dosyada şunları görüyor:")
+            for i, tbl in enumerate(debug_info):
+                st.write(f"Tablo {i+1}:")
+                st.dataframe(tbl)
+                
+    except Exception as e:
+        st.error(f"Hata oluştu: {e}")
