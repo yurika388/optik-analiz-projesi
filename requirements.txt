@@ -1,6 +1,5 @@
 streamlit
+pdfplumber
 pandas
-pytesseract
-pdf2image
-opencv-python-headless==4.8.1.78
-Pillow
+xlsxwriter
+openpyxl
