@@ -4,194 +4,215 @@ import pandas as pd
 import re
 from io import BytesIO
 
-# Sayfa Ayarları
-st.set_page_config(page_title="Dershane Konu Analizi", layout="wide")
+st.set_page_config(page_title="Kesin Çözüm Analiz", layout="wide")
+st.title("🎯 Koordinatlı Karne Analiz Sistemi")
+st.markdown("**Hedef:** Sadece öğrenci karnelerini (1. Tip PDF) hatasız okumak.")
 
-st.title("📊 Dershane Sınav Analiz Sistemi")
-st.markdown("""
-Bu sistem, **Yaprak Kurs Merkezi** ve benzeri formatlardaki karne PDF'lerini analiz eder.
-Öğrenci bazlı konu eksiklerini tespit etmek için geliştirilmiştir.
-""")
+uploaded_file = st.file_uploader("Karne PDF'ini Yükle", type=["pdf"])
 
-uploaded_file = st.file_uploader("PDF Dosyasını Yükleyin", type=["pdf"])
+def clean_subject_name(text):
+    """Konu ismindeki gereksiz karakterleri ve TYT/AYT gibi başlıkları temizler."""
+    if not text: return ""
+    text = text.strip()
+    # Başında rakam varsa sil (Örn: "1. HÜCRE" -> "HÜCRE")
+    text = re.sub(r'^\d+[\.,\-\s]*', '', text)
+    return text
 
-def extract_student_and_questions(file):
+def parse_row_data(line):
     """
-    PDF'ten öğrenci adı, sınıfı ve konu bazlı doğru/yanlış verilerini çıkarır.
+    Bir satırın sonundaki veri desenini analiz eder.
+    Dönen değer: (Veri Tipi, Veri Sözlüğü, Veri Başlangıç İndeksi)
     """
+    line = line.rstrip()
+    if not line: return None, None, 0
+    
+    # DESEN 1: "1 0 1 0" veya "1010" (Binary)
+    # Satır sonundaki 0 ve 1'lerden oluşan kümeyi bul.
+    # Örn: "HÜCRE BÖLÜNMELERİ                           1 0 1 0"
+    binary_match = re.search(r'([01\s]{3,})$', line)
+    
+    if binary_match:
+        raw_data = binary_match.group(1)
+        clean_data = raw_data.replace(" ", "")
+        # Sadece 0 ve 1'den oluştuğuna emin ol (bazen sayfa numarası karışabilir)
+        if all(c in "01" for c in clean_data) and len(clean_data) >= 1:
+            return "binary", {
+                "binary_string": clean_data,
+                "toplam": len(clean_data),
+                "dogru": clean_data.count('1'),
+                "yanlis": clean_data.count('0')
+            }, binary_match.start()
+
+    # DESEN 2: "4 2 2" veya "4 2 2 1,5" (Sayısal: Soru Doğru Yanlış Net)
+    # Satır sonunda boşluklarla ayrılmış sayılar kümesi
+    numeric_match = re.search(r'(\d+\s+\d+\s+\d+(\s+[\d\.,]+)?)$', line)
+    
+    if numeric_match:
+        raw_data = numeric_match.group(1)
+        # Sayıları ayıkla
+        nums = re.findall(r'[\d\.,]+', raw_data)
+        if len(nums) >= 3:
+            try:
+                toplam = int(nums[0])
+                dogru = int(nums[1])
+                yanlis = int(nums[2])
+                # Mantık kontrolü: Toplam soru sayısı doğru+yanlıştan küçük olamaz (boş yoksa)
+                # ve toplam soru sayısı aşırı büyük olamaz (sayfa nosu karışmasın diye)
+                if toplam < 50 and toplam >= (dogru + yanlis): 
+                    return "numeric", {
+                        "toplam": toplam,
+                        "dogru": dogru,
+                        "yanlis": yanlis
+                    }, numeric_match.start()
+            except:
+                pass
+
+    return None, None, 0
+
+def extract_exact_data(file):
     results = []
     
     with pdfplumber.open(file) as pdf:
         for page_num, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            if not text:
-                continue
+            # layout=True: Bu parametre satır hizasını korumak için hayati önem taşır!
+            text = page.extract_text(layout=True) 
+            if not text: continue
             
             lines = text.split('\n')
             
-            # Mevcut öğrenci bilgileri
-            current_student = None
-            current_class = "Belirtilmemiş"
+            current_student = "Bilinmeyen Öğrenci"
             
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                
-                # --- 1. ÖĞRENCİ ADI TESPİTİ ---
-                # İsim genelde büyük harflerle yazılır ve belirli anahtar kelimelerden sonra gelir
-                # Örnek: "Sayın VELİ", "Öğrenci: AHMET" veya direkt satırda isim
-                
-                # Basit ve etkili bir isim yakalama mantığı:
-                # Satırda "İsim", "Öğrenci" varsa veya satır sadece büyük harfli isimden oluşuyorsa
-                if ("İsim" in line or "Öğrenci" in line) and i+1 < len(lines):
-                     # Alt satıra bak
-                     candidate = lines[i+1].strip()
-                     if len(candidate) > 5 and not any(k in candidate for k in ["TYT", "NET", "PUAN"]):
-                         current_student = candidate
-                elif line.isupper() and len(line) > 6 and " " in line:
-                    # Satır tamamen büyük harf ve içinde boşluk varsa (AD SOYAD gibi)
-                    # Ancak ders isimleri veya başlıklar olmamalı
-                    yasakli_kelimeler = ["TYT", "AYT", "LİSTESİ", "SINAVI", "MERKEZİ", "TÜRKÇE", "MATEMATİK", "SOSYAL", "FEN"]
-                    if not any(y in line for y in yasakli_kelimeler):
-                        current_student = line
+            # --- 1. ADIM: ÖĞRENCİ ADI BULMA (Sayfanın üst %20'sinde) ---
+            header_lines = lines[:15] # İlk 15 satıra bak
+            for line in header_lines:
+                clean_line = line.strip()
+                # Genelde İsim satırında "İsim", "Öğrenci", "Sayın" yazar veya sadece isim vardır.
+                # Regex ile "Adı Soyadı" formatı yakala (En az iki kelime, hepsi büyük harf)
+                if len(clean_line) > 5 and " " in clean_line:
+                    # Yasaklı kelimeler (Başlıklar)
+                    if any(x in clean_line for x in ["YAPRAK", "MERKEZİ", "TYT", "AYT", "LİSTESİ", "SINAV", "TARİH"]):
+                        continue
+                    
+                    # İsim genellikle büyük harflerle yazılır
+                    if clean_line.isupper() and not any(char.isdigit() for char in clean_line):
+                        current_student = clean_line
+                        break # İsmi bulduk, döngüden çık
+            
+            # --- 2. ADIM: SATIR SATIR VERİ ANALİZİ ---
+            last_valid_index = -1 # Çok satırlı konuları birleştirmek için
+            
+            for i, line in enumerate(lines):
+                # Başlık kısımlarını atla (TYT Türkçe vb.)
+                if "TYT" in line or "Toplam" in line or "Genel Ortalama" in line:
+                    continue
 
-                # --- 2. SINIF BİLGİSİ ---
-                if "Sınıf" in line or "SINIF" in line:
-                    class_match = re.search(r'(Sınıf|SINIF)[:\s]*(\d+\s*[A-Za-z]?)', line)
-                    if class_match:
-                        current_class = class_match.group(2)
+                type, data, data_start_index = parse_row_data(line)
                 
-                # --- 3. KONU VE VERİ ANALİZİ ---
-                # Sadece öğrenci bulunduktan sonra veri aramaya başla
-                # (Ancak bazı PDF'lerde isim en altta olabilir, o yüzden bu şartı esnetiyoruz)
-                
-                # Potansiyel konu adı (uzun metin)
-                # Başlıkları ele (TYT, TOPLAM vb.)
-                if len(line) > 5 and not any(x in line for x in ["TYT", "SOSYAL", "MATEMATİK", "FEN", "TOPLAM", "GENEL", "NET", "ORTALAMA"]):
+                if type:
+                    # Veriyi bulduk! Şimdi konuyu alalım.
+                    # Verinin başladığı yerden öncesi konudur.
+                    raw_subject = line[:data_start_index].strip()
                     
-                    match = None
-                    match_type = None
+                    # ÇOK SATIRLI KONU KONTROLÜ
+                    # Eğer konu adı boşsa veya çok kısaysa, bir üst satıra bakmalıyız.
+                    # Örn: 
+                    # Satır 10: "HÜCRE" (Burada puan yok)
+                    # Satır 11: "BÖLÜNMELERİ           1010" (Burada puan var)
                     
-                    # Regex Desenleri
-                    # Format 1: "Konu Adı 4 3 1 75" (Soru - Doğru - Yanlış - Net/Puan)
-                    pattern1 = r'(.+?)\s+(\d+)\s+(\d+)\s+(\d+)(\s+[\d\.,]+)?$'
+                    final_subject = raw_subject
                     
-                    # Format 2: "Konu Adı 1010" (Binary Sistem)
-                    pattern2 = r'(.+?)\s+([01\s]{3,})$'
+                    if len(final_subject) < 3 and i > 0:
+                         prev_line = lines[i-1].strip()
+                         # Üst satırda sayısal veri yoksa, o satır konu devamıdır.
+                         _, prev_data, _ = parse_row_data(prev_line)
+                         if not prev_data:
+                             final_subject = prev_line + " " + final_subject
                     
-                    # Önce Sayısal (3 2 1) dene
-                    m1 = re.match(pattern1, line)
-                    if m1:
-                        # Sayısal mantık kontrolü: Toplam = Doğru + Yanlış mı?
-                        try:
-                            toplam = int(m1.group(2))
-                            dogru = int(m1.group(3))
-                            yanlis = int(m1.group(4))
-                            if toplam >= dogru + yanlis: # Mantıklı veri
-                                match = m1
-                                match_type = "numeric"
-                        except: pass
+                    final_subject = clean_subject_name(final_subject)
+                    
+                    # Eğer hala konu adı yoksa (tablo kaymışsa) atla
+                    if len(final_subject) < 2: continue
 
-                    # Eğer sayısal değilse Binary (1010) dene
-                    if not match:
-                        m2 = re.match(pattern2, line)
-                        if m2:
-                            binary_part = m2.group(2).replace(" ", "")
-                            if all(c in "01" for c in binary_part):
-                                match = m2
-                                match_type = "binary"
-                    
-                    # EŞLEŞME VARSA KAYDET
-                    if match:
-                        if match_type == "numeric":
-                            konu = match.group(1).strip()
-                            toplam = int(match.group(2))
-                            dogru = int(match.group(3))
-                            yanlis = int(match.group(4))
-                            basari = int((dogru/toplam)*100) if toplam > 0 else 0
-                            
-                        elif match_type == "binary":
-                            konu = match.group(1).strip()
-                            binary_str = match.group(2).replace(" ", "")
-                            toplam = len(binary_str)
-                            dogru = binary_str.count('1')
-                            yanlis = binary_str.count('0')
-                            basari = int((dogru/toplam)*100) if toplam > 0 else 0
+                    # Başarı oranı hesabı
+                    basari = 0
+                    if data["toplam"] > 0:
+                        basari = int((data["dogru"] / data["toplam"]) * 100)
 
-                        # Konu adı temizliği (Gereksiz kısa veya anlamsız şeyleri at)
-                        if len(konu) > 2:
-                            results.append({
-                                "Öğrenci": current_student if current_student else "İsimsiz Öğrenci",
-                                "Sınıf": current_class,
-                                "Konu": konu,
-                                "Toplam Soru": toplam,
-                                "Doğru": dogru,
-                                "Yanlış": yanlis,
-                                "Başarı %": basari
-                            })
-                
-                i += 1
-    
+                    results.append({
+                        "Öğrenci": current_student,
+                        "Sayfa": page_num + 1,
+                        "Konu": final_subject,
+                        "Toplam": data["toplam"],
+                        "Doğru": data["dogru"],
+                        "Yanlış": data["yanlis"],
+                        "Başarı %": basari,
+                        "Veri Tipi": type
+                    })
+
     return pd.DataFrame(results)
 
 if uploaded_file:
-    st.write("📂 PDF analiz ediliyor... Lütfen bekleyin.")
+    st.info("PDF taranıyor... 'Layout Modu' devrede.")
     
-    with st.spinner("Veriler taranıyor..."):
-        try:
-            df = extract_student_and_questions(uploaded_file)
+    try:
+        df = extract_exact_data(uploaded_file)
+        
+        if not df.empty:
+            st.success(f"Analiz Tamamlandı! {len(df)} konu verisi bulundu.")
             
-            if not df.empty:
-                st.success(f"✅ İşlem Başarılı! Toplam {len(df)} veri satırı çekildi.")
-                
-                # Öğrenci Filtresi (Varsa)
-                ogrenciler = df["Öğrenci"].unique()
-                selected_student = st.selectbox("Öğrenci Seçin:", ["Tümü"] + list(ogrenciler))
-                
-                if selected_student != "Tümü":
-                    display_df = df[df["Öğrenci"] == selected_student]
-                else:
-                    display_df = df
-
-                # Veri Gösterimi
-                st.subheader("📋 Analiz Tablosu")
-                st.dataframe(display_df, use_container_width=True)
-                
-                # İstatistikler
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Ortalama Başarı", f"%{display_df['Başarı %'].mean():.1f}")
-                col2.metric("Toplam Soru", display_df['Toplam Soru'].sum())
-                col3.metric("Toplam Doğru", display_df['Doğru'].sum())
-                
-                # Grafik
-                st.subheader("📊 Konu Başarı Grafiği (En Zayıf 15 Konu)")
-                chart_data = display_df.groupby("Konu")["Başarı %"].mean().sort_values().head(15)
-                st.bar_chart(chart_data)
-                
-                # Excel İndirme Butonu
-                st.subheader("💾 Raporu İndir")
-                
-                # Excel formatı için buffer kullanımı
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    display_df.to_excel(writer, index=False, sheet_name='Analiz')
-                processed_data = output.getvalue()
-                
-                st.download_button(
-                    label="📥 Excel Olarak İndir (.xlsx)",
-                    data=processed_data,
-                    file_name='dershane_analiz_raporu.xlsx',
-                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            # --- ANA EKRAN ---
+            # Öğrenci Bazlı Gösterim
+            students = df["Öğrenci"].unique()
+            selected_student = st.selectbox("Öğrenci Seçin", students)
+            
+            student_df = df[df["Öğrenci"] == selected_student].copy()
+            
+            # Metrikler
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Toplam Soru", student_df["Toplam"].sum())
+            c2.metric("Toplam Doğru", student_df["Doğru"].sum())
+            c3.metric("Genel Başarı", f"%{int(student_df['Doğru'].sum() / student_df['Toplam'].sum() * 100)}")
+            
+            st.divider()
+            
+            col_table, col_chart = st.columns([1.5, 1])
+            
+            with col_table:
+                st.subheader("📝 Konu Karnesi")
+                # Görsellik için dataframe'i boyayalım
+                st.dataframe(
+                    student_df[["Konu", "Toplam", "Doğru", "Yanlış", "Başarı %"]],
+                    use_container_width=True,
+                    height=500
                 )
-                
-            else:
-                st.error("Veri bulunamadı. PDF formatı desteklenmiyor olabilir.")
-                st.warning("Debug: PDF metnini kontrol etmek için aşağıya bakabilirsiniz.")
-                with pdfplumber.open(uploaded_file) as pdf:
-                    st.text(pdf.pages[0].extract_text())
-                    
-        except Exception as e:
-            st.error(f"Bir hata oluştu: {e}")
             
-else:
-    st.info("Sol üstteki menüden bir PDF yükleyerek başlayın.")
+            with col_chart:
+                st.subheader("🚨 Alarm Veren Konular")
+                # %50 altı başarı olan konular
+                weak_topics = student_df[student_df["Başarı %"] < 50].sort_values("Başarı %")
+                if not weak_topics.empty:
+                    st.error(f"{len(weak_topics)} konuda eksik tespit edildi!")
+                    st.bar_chart(weak_topics.set_index("Konu")["Başarı %"])
+                else:
+                    st.success("Kritik eksik konu bulunamadı!")
+
+            # Excel İndirme
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name='Tum_Veriler')
+            
+            st.download_button(
+                "📥 Tüm Verileri Excel İndir",
+                data=output.getvalue(),
+                file_name="detayli_karne_analizi.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+        else:
+            st.error("Veri çekilemedi. PDF formatı çok farklı olabilir.")
+            st.write("Debug: PDF'in ilk sayfasının ham görüntüsü:")
+            with pdfplumber.open(uploaded_file) as pdf:
+                st.text(pdf.pages[0].extract_text(layout=True))
+
+    except Exception as e:
+        st.error(f"Kritik Hata: {e}")
