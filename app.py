@@ -3,140 +3,121 @@ import pdfplumber
 import pandas as pd
 import re
 
-st.set_page_config(page_title="Dershane Analiz Pro", layout="wide")
+st.set_page_config(page_title="Dershane Analiz - Tam Çözüm", layout="wide")
 
-st.title("🎓 Dershane Gelişmiş Analiz Sistemi")
-st.markdown("PDF dosyanızı yükleyin. Sistem, **Sıralı Listeleri** ve **Öğrenci Karnelerini** otomatik ayırt edip analiz eder.")
+st.title("🎯 Nokta Atışı Analiz Sistemi")
+st.info("Bu sistem, yüklenen karne PDF'indeki 'HÜCRE 1010' gibi gizli desenleri tarar.")
 
-uploaded_file = st.file_uploader("PDF Dosyasını Buraya Sürükleyin", type=["pdf"])
+uploaded_file = st.file_uploader("Karne PDF'ini Yükle (Örn: 3D TYT Karne)", type=["pdf"])
 
-def parse_pdf_content(file):
-    """
-    PDF içindeki hem 'Sıralı Liste'yi hem de 'Konu Analiz' tablolarını yakalar.
-    """
-    all_tables = []
-    student_reports = []
-    class_list_data = []
+def extract_data_aggressive(file):
+    student_data = []
     
     with pdfplumber.open(file) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            # Sayfadaki tüm tabloları çek
-            tables = page.extract_tables()
+        for page in pdf.pages:
+            # Sayfayı metin olarak al (layout=True ile boşlukları koruruz)
+            text = page.extract_text(x_tolerance=2, y_tolerance=2)
+            if not text: continue
             
-            for table in tables:
-                # Tablo boşsa atla
-                if not table: continue
-                
-                # --- FORMAT 1: SINIF LİSTESİ ANALİZİ ---
-                # Genelde "SIRA NO", "ADI SOYADI", "TYT" gibi başlıklar içerir
-                df_temp = pd.DataFrame(table)
-                # İlk satırları birleştirip içinde anahtar kelime var mı bak
-                header_text = " ".join([str(x) for x in df_temp.head(3).values.flatten()]).upper()
-                
-                if "ADI SOYADI" in header_text and ("TYT" in header_text or "NET" in header_text):
-                    # Bu bir sınıf listesidir, temizleyip alalım
-                    # Başlık satırını bulmaya çalış
-                    start_row = 0
-                    for i, row in enumerate(table):
-                        row_str = " ".join([str(x) for x in row if x]).upper()
-                        if "ADI SOYADI" in row_str:
-                            start_row = i + 1 # Başlıktan sonraki satır veridir
-                            break
-                    
-                    if start_row < len(table):
-                        for row in table[start_row:]:
-                            # Satırın dolu olduğundan ve bir öğrenci adı içerdiğinden emin ol
-                            # Genelde Ad Soyad 2. veya 3. sütundadır
-                            clean_row = [x for x in row if x is not None]
-                            if len(clean_row) > 3: # En azından Sıra, Ad, Net olmalı
-                                class_list_data.append(clean_row)
+            lines = text.split('\n')
+            
+            # 1. ÖĞRENCİ ADI BULMA (Agresif Yöntem)
+            student_name = "Bilinmeyen Öğrenci"
+            class_name = "Belirsiz"
+            
+            for line in lines:
+                # Genelde İsim: veya Sayın: ile başlar ya da büyük harfli isim satırıdır
+                if "Sayın" in line or "İsim" in line or "Öğrenci" in line:
+                    # İsim satırını temizle
+                    clean_line = line.replace("Sayın", "").replace("İsim", "").replace("Öğrenci", "").strip()
+                    # Eğer satırda harf varsa isimdir
+                    if len(clean_line) > 5:
+                        student_name = clean_line
+                        break
+            
+            # Eğer yukarıdaki çalışmazsa, PDF'in en üstündeki büyük harfli satır isim olabilir
+            if student_name == "Bilinmeyen Öğrenci":
+                 for line in lines[:5]: # İlk 5 satıra bak
+                     if len(line) > 5 and not "YAPRAK" in line and not "TYT" in line:
+                         student_name = line
+                         break
 
-                # --- FORMAT 2: KONU ANALİZ KARNESİ ---
-                # Genelde satırlarda "Cümle Anlamı", "Hücre" gibi konular ve yanlarında rakamlar olur
-                # Bu kısım biraz daha "sezgisel" olmalı
-                for row in table:
-                    # Satırdaki verileri temizle
-                    row_clean = [str(x).replace('\n', ' ').strip() for x in row if x]
+            # 2. KONU VE PERFORMANS BULMA (REGEX)
+            # Desen: Türkçe karakterli kelimeler + boşluk + sadece 0 ve 1'lerden oluşan kod
+            # Örnek: "HÜCRE 1010" veya "SÖZCÜKTE ANLAM 1110"
+            
+            # Regex Açıklaması:
+            # ([A-ZİĞÜŞÖÇ\s\(\)-]{3,}) -> En az 3 harfli BÜYÜK HARFLİ konu adı (HÜCRE vb.)
+            # \s+ -> Boşluk
+            # ([01\s]{2,}) -> En az 2 haneli 1 ve 0 serisi (1010 gibi)
+            pattern = re.compile(r"([A-ZİĞÜŞÖÇ\s\(\)-]{3,})\s+([01\s]{2,})")
+            
+            for line in lines:
+                match = pattern.search(line)
+                if match:
+                    konu = match.group(1).strip()
+                    kod = match.group(2).replace(" ", "") # Aradaki boşlukları sil "1 0 1" -> "101"
                     
-                    if len(row_clean) >= 2:
-                        konu_adi = row_clean[0]
-                        # Konu adı genelde metindir, diğerleri sayıdır
-                        # Örn: ["Cümle Anlamı", "4", "3", "1", "%75"]
-                        
-                        # Basit bir filtre: Konu adı çok kısa değilse ve yanındaki sütunlar sayı içeriyorsa
-                        if len(konu_adi) > 3 and any(char.isdigit() for char in "".join(row_clean[1:])):
-                            # Sayısal verileri ayıkla
-                            try:
-                                # Sayı bulucu regex
-                                numbers = re.findall(r'\d+', " ".join(row_clean[1:]))
-                                if len(numbers) >= 2: # En az Toplam ve Doğru sayısı olmalı
-                                    toplam = int(numbers[0])
-                                    dogru = int(numbers[1])
-                                    
-                                    # Başarı oranı hesabı (Eğer % sütunu yoksa biz hesaplayalım)
-                                    basari = 0
-                                    if toplam > 0:
-                                        basari = int((dogru / toplam) * 100)
-                                    
-                                    durum = "🟢 İyi"
-                                    if basari < 50: durum = "🔴 Kritik"
-                                    elif basari < 70: durum = "🟡 Orta"
-                                    
-                                    student_reports.append({
-                                        "Sayfa": page_num + 1,
-                                        "Konu": konu_adi,
-                                        "Toplam Soru": toplam,
-                                        "Doğru": dogru,
-                                        "Başarı %": basari,
-                                        "Durum": durum
-                                    })
-                            except:
-                                pass # Sayısal çevrim hatası olursa geç
-
-    return class_list_data, pd.DataFrame(student_reports)
+                    # Hatalı yakalamaları ele (Sadece rakam olanları veya çok uzun metinleri at)
+                    if len(konu) > 40 or len(kod) < 1: continue
+                    if "TYT" in konu or "TOPLAM" in konu: continue # Başlıkları at
+                    
+                    # Veriyi Analiz Et
+                    dogru = kod.count('1')
+                    yanlis_bos = kod.count('0')
+                    toplam = len(kod)
+                    basari = int((dogru/toplam)*100) if toplam > 0 else 0
+                    
+                    student_data.append({
+                        "Öğrenci": student_name,
+                        "Konu": konu,
+                        "Analiz Kodu": kod, # Debug için bunu görelim
+                        "Soru": toplam,
+                        "Doğru": dogru,
+                        "Yanlış/Boş": yanlis_bos,
+                        "Başarı %": basari
+                    })
+                    
+    return pd.DataFrame(student_data)
 
 if uploaded_file:
-    with st.spinner('PDF taranıyor, tablolar ayrıştırılıyor...'):
-        try:
-            class_data, topic_df = parse_pdf_content(uploaded_file)
+    st.write("Dosya işleniyor...")
+    df = extract_data_aggressive(uploaded_file)
+    
+    if not df.empty:
+        st.success(f"Analiz Başarılı! {len(df)} adet konu verisi çekildi.")
+        
+        # Öğrenci Seçimi (Birden fazla karne varsa)
+        selected_student = st.selectbox("Öğrenci Seçin:", df["Öğrenci"].unique())
+        student_df = df[df["Öğrenci"] == selected_student]
+        
+        # Üst Metrikler
+        col1, col2, col3 = st.columns(3)
+        toplam_d = student_df["Doğru"].sum()
+        toplam_y = student_df["Yanlış/Boş"].sum()
+        ort_basari = student_df["Başarı %"].mean()
+        
+        col1.metric("Toplam Doğru", toplam_d)
+        col2.metric("Toplam Yanlış/Boş", toplam_y)
+        col3.metric("Ortalama Konu Başarısı", f"%{ort_basari:.1f}")
+        
+        st.divider()
+        
+        # 1. KRİTİK KONULAR TABLOSU
+        st.subheader("🔴 Alarm Veren Konular (Başarı < %50)")
+        kritik = student_df[student_df["Başarı %"] < 50]
+        if not kritik.empty:
+            st.dataframe(kritik[["Konu", "Doğru", "Yanlış/Boş", "Başarı %"]], use_container_width=True)
+        else:
+            st.success("Kritik seviyede konu yok, tebrikler!")
             
-            st.success("İşlem Tamamlandı!")
+        # 2. DETAYLI LİSTE
+        with st.expander("Tüm Konu Analizini Gör"):
+            st.dataframe(student_df)
             
-            tab1, tab2 = st.tabs(["📋 Sınıf Sıralama Listesi", "📊 Detaylı Konu Analizi"])
-            
-            with tab1:
-                st.subheader("Sınıf Genel Listesi (Bulunan Veriler)")
-                if class_data:
-                    # Ham veriyi göster (Sütun isimlerini dinamik yapıyoruz çünkü her PDF farklıdır)
-                    df_class = pd.DataFrame(class_data)
-                    st.dataframe(df_class)
-                    st.info("Not: Bu tablo PDF'den ham olarak çekilmiştir. İlk sütunlar genelde Sıra ve İsimdir.")
-                else:
-                    st.warning("Bu dosyada toplu sıralama listesi tespit edilemedi veya formatı farklı.")
-
-            with tab2:
-                st.subheader("Konu Bazlı Eksik Analizi")
-                if not topic_df.empty:
-                    # Filtreleme
-                    durum_filter = st.multiselect("Filtrele (Durum)", ["🔴 Kritik", "🟡 Orta", "🟢 İyi"], default=["🔴 Kritik"])
-                    
-                    if durum_filter:
-                        filtered_df = topic_df[topic_df["Durum"].isin(durum_filter)]
-                    else:
-                        filtered_df = topic_df
-
-                    st.dataframe(filtered_df, use_container_width=True)
-                    
-                    # Grafik
-                    st.bar_chart(filtered_df.set_index("Konu")["Başarı %"])
-                    
-                    st.markdown("### 📢 Öğretmen İçin Özet")
-                    kritik_konular = topic_df[topic_df["Durum"] == "🔴 Kritik"]["Konu"].value_counts().head(5)
-                    st.write("Sınıf genelinde en çok hata yapılan 5 konu:")
-                    for konu, sayi in kritik_konular.items():
-                        st.error(f"- {konu} (Bu konu {sayi} kez kritik seviyede çıkmış)")
-                else:
-                    st.warning("Detaylı konu analizi bulunamadı. PDF sadece sıralı liste olabilir mi?")
-                    
-        except Exception as e:
-            st.error(f"Bir hata oluştu: {e}")
+    else:
+        st.error("Veri çekilemedi! PDF'in metin formatı beklenen 'KONU 1010' yapısında olmayabilir.")
+        # Debug Modu: Kullanıcıya PDF'in metnini gösterelim ki ne gördüğümüzü anlasın
+        with pdfplumber.open(uploaded_file) as pdf:
+            st.text("SİSTEMİN GÖRDÜĞÜ METİN (İlk Sayfa):")
+            st.code(pdf.pages[0].extract_text())
