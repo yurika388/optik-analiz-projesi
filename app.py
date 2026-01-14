@@ -1,120 +1,83 @@
 import streamlit as st
-import pdfplumber
 import pandas as pd
+import pytesseract
+import cv2
+import numpy as np
+from pdf2image import convert_from_bytes
+import re
 
-st.set_page_config(page_title="Dershane Analiz - Tablo Modu", layout="wide")
+st.set_page_config(layout="wide")
+st.title("🎯 Yaprak PDF Zeka Motoru")
 
-st.title("🛡️ Tablo Tabanlı Kesin Çözüm")
-st.info("Bu modül, PDF içindeki tabloları doğrudan analiz eder. Metin kaymalarından etkilenmez.")
+uploaded = st.file_uploader("PDF Yükle", type="pdf")
 
-uploaded_file = st.file_uploader("PDF Dosyasını Yükle", type=["pdf"])
+# ---------------- OCR ----------------
 
-def clean_text(text):
-    """Metindeki gereksiz boşlukları ve satır atlamaları temizler."""
-    if text:
-        return str(text).replace('\n', ' ').strip()
-    return ""
+def ocr_page(img):
+    gray = cv2.cvtColor(np.array(img), cv2.COLOR_BGR2GRAY)
+    gray = cv2.threshold(gray,150,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
+    return pytesseract.image_to_string(gray, lang="tur")
 
-def is_topic_row(row):
-    """
-    Bir satırın 'Konu Analiz Satırı' olup olmadığını anlamaya çalışır.
-    Mantık: İlk sütun metin olmalı, diğer sütunlarda rakamlar (1010 veya net sayısı) olmalı.
-    """
-    # Satır boşsa veya çok kısaysa atla
-    clean_row = [x for x in row if x is not None and str(x).strip() != ""]
-    if len(clean_row) < 2:
-        return False
-    
-    first_cell = clean_text(clean_row[0])
-    last_cell = clean_text(clean_row[-1])
-    
-    # Konu adı çok kısa olamaz (Örn: "A", "B" şıkkı değildir)
-    if len(first_cell) < 3: 
-        return False
-        
-    # İlk hücrede "TOPLAM", "NET", "SIRA" gibi başlıklar varsa atla
-    forbidden_words = ["TOPLAM", "GENEL", "SIRA", "ADI", "SOYADI", "TYT", "NET"]
-    if any(word in first_cell.upper() for word in forbidden_words):
-        return False
+# ---------------- Öğrenci Yakalama ----------------
 
-    # Son hücrede veya ikinci hücrede rakam var mı? (10101 veya 3 1 2)
-    # Rakam barındırıyor mu kontrolü
-    has_digits = any(char.isdigit() for char in last_cell)
-    
-    return has_digits
+def find_student(text):
+    for line in text.split("\n"):
+        if line.isupper() and len(line)>10 and not any(x in line for x in ["TYT","YAPRAK","LIST","SIRA","TOPLAM"]):
+            return line.strip()
+    return "BULUNAMADI"
 
-def extract_tables_logic(file):
-    all_data = []
-    debug_tables = [] # Ne gördüğümüzü anlamak için
-    
-    with pdfplumber.open(file) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            # Sayfadaki tüm tabloları çıkar
-            tables = page.extract_tables()
-            
-            for table in tables:
-                if not table: continue
-                
-                # Tablodaki her satıra bak
-                for row in table:
-                    # Satır boş mu?
-                    if not any(row): continue
-                    
-                    # Bu satır bir konu analizi mi?
-                    if is_topic_row(row):
-                        # Veriyi temizle
-                        konu = clean_text(row[0]) # Genelde ilk sütun konudur
-                        
-                        # Verinin geri kalanı (Performans)
-                        # Bazen sütunlar kayar, geri kalan tüm dolu hücreleri birleştirelim
-                        diger_hucreler = [clean_text(x) for x in row[1:] if x is not None]
-                        veri_yigini = " ".join(diger_hucreler)
-                        
-                        all_data.append({
-                            "Sayfa": page_num + 1,
-                            "Konu Olasılığı": konu,
-                            "Veri": veri_yigini
-                        })
-                
-                # Debug için tabloyu kaydedelim (İlk 5 satır)
-                debug_tables.append(pd.DataFrame(table).head(3))
+# ---------------- Konu Satırı Yakalama ----------------
 
-    return pd.DataFrame(all_data), debug_tables
+def parse_topic(line):
+    # 101001 format
+    bin_match = re.search(r'([01]{4,})$', line)
+    if bin_match:
+        code = bin_match.group(1)
+        konu = line.replace(code,"").strip()
+        return konu, code.count("1"), code.count("0"), len(code)
 
-if uploaded_file:
-    st.write("Tablolar taranıyor...")
-    
-    try:
-        df_results, debug_info = extract_tables_logic(uploaded_file)
-        
-        if not df_results.empty:
-            st.success(f"Toplam {len(df_results)} adet veri satırı bulundu!")
-            
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                st.subheader("📊 Çıkarılan Ham Veriler")
-                st.dataframe(df_results, use_container_width=True)
-                
-            with col2:
-                st.subheader("🔍 Nasıl Yorumlamalı?")
-                st.markdown("""
-                Sistem PDF'teki tablo satırlarını çıkardı.
-                - **Konu Olasılığı:** Satırın başındaki yazı.
-                - **Veri:** Yanındaki rakamlar (1010 veya doğru/yanlış sayıları).
-                
-                Eğer burada verileri doğru görüyorsan, artık bunları sayıya döküp grafiğe çevirmek çocuk oyuncağı.
-                """)
-                
-        else:
-            st.error("Tablo yapısı tespit edilemedi veya veriler beklenen formatta değil.")
-            st.warning("Aşağıdaki 'Sistemin Gördüğü' kısmına bakarak PDF'in nasıl okunduğunu kontrol et.")
-            
-        with st.expander("🛠️ Geliştirici Modu: Sistemin Gördüğü Tablolar (Debug)"):
-            st.write("PDF Plumber bu dosyada şunları görüyor:")
-            for i, tbl in enumerate(debug_info):
-                st.write(f"Tablo {i+1}:")
-                st.dataframe(tbl)
-                
-    except Exception as e:
-        st.error(f"Hata oluştu: {e}")
+    # 4 3 1 format
+    num_match = re.search(r'(\d+)\s+(\d+)\s+(\d+)$', line)
+    if num_match:
+        t,d,y = num_match.groups()
+        konu = line.replace(num_match.group(0),"").strip()
+        return konu, int(d), int(y), int(t)
+
+    return None
+
+# ---------------- PDF ANALİZ ----------------
+
+if uploaded:
+    images = convert_from_bytes(uploaded.read(), dpi=300)
+
+    results = []
+
+    for i, img in enumerate(images):
+        text = ocr_page(img)
+        student = find_student(text)
+
+        for line in text.split("\n"):
+            parsed = parse_topic(line)
+            if parsed:
+                konu, d, y, t = parsed
+                if len(konu)>3:
+                    results.append({
+                        "Öğrenci": student,
+                        "Sayfa": i+1,
+                        "Konu": konu,
+                        "Doğru": d,
+                        "Yanlış": y,
+                        "Toplam": t,
+                        "Başarı %": int(d/t*100) if t>0 else 0
+                    })
+
+    df = pd.DataFrame(results)
+
+    if not df.empty:
+        st.success(f"{len(df)} adet konu yakalandı")
+        st.dataframe(df)
+
+        st.subheader("📊 Öğrenci Başarıları")
+        st.bar_chart(df.groupby("Öğrenci")["Başarı %"].mean())
+    else:
+        st.error("Bu PDF’te veri bulunamadı")
